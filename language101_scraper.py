@@ -8,6 +8,7 @@ import json
 import os
 import re
 import requests
+import sys
 
 
 from random import randint
@@ -19,6 +20,34 @@ from http.cookiejar import MozillaCookieJar
 from urllib.parse import urlparse
 
 
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+
+def load_config():
+    """Load configuration from config.json"""
+    try:
+        if not os.path.exists(CONFIG_FILE):
+            return None
+            
+        with open(CONFIG_FILE, 'r') as f:
+            config = json.load(f)
+            return config
+    except Exception as e:
+        print(f"Error loading config: {e}")
+        return None
+
+def save_config(username, password):
+    """Save configuration to config.json"""
+    try:
+        config = {
+            'username': username,
+            'password': password
+        }
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=4)
+        print("Credentials saved to config.json")
+    except Exception as e:
+        print(f"Error saving config: {e}")
+
 parser = argparse.ArgumentParser(description='Scrape full language courses by Innovative Language.')
 parser.add_argument('-u', '--username', help='Username (email)')
 parser.add_argument('-p', '--password', help='Password for the course')
@@ -26,8 +55,22 @@ parser.add_argument('--url', help='URL for the first lesson of the course')
 
 args = parser.parse_args()
 
-USERNAME = args.username or input('Username (email): ')
-PASSWORD = args.password or input('Password: ')
+config = load_config()
+
+# If credentials are provided via command line, use those
+if args.username and args.password:
+    USERNAME = args.username
+    PASSWORD = args.password
+    # Save the new credentials
+    save_config(USERNAME, PASSWORD)
+elif config:
+    USERNAME = config['username']
+    PASSWORD = config['password']
+else:
+    USERNAME = input('Username (email): ')
+    PASSWORD = input('Password: ')
+    # Save the entered credentials
+    save_config(USERNAME, PASSWORD)
 COURSE_URL = args.url or input('Please insert first lesson URL of the desired course, for example:\n'
                                '* https://www.japanesepod101.com/lesson/lower-beginner-1-a-formal-japanese'
                                '-introduction/?lp=116\n '
@@ -132,10 +175,12 @@ def check_http_error(response, fail_safe=False):
     exit(1)
 
 class MediaDownloader:
-    def __init__(self, session, source_url):
+    def __init__(self, session, source_url, save_dir='.'):
         self.session = session
         self.source_url = source_url
-        self.invalid_chars = '\\/?:*"<>|'
+        self.invalid_chars = '\/?:*"<>|'
+        self.save_dir = save_dir
+        os.makedirs(save_dir, exist_ok=True)
 
     def clean_filename(self, text):
         """Remove invalid characters from filename"""
@@ -143,15 +188,22 @@ class MediaDownloader:
             text = text.replace(char, "")
         return text
 
-    def create_filename(self, file_prefix, title, suffix, extension):
+    def create_filename(self, title, suffix, extension):
         """Create a standardized filename"""
         clean_title = self.clean_filename(title)
-        return f'{file_prefix} - {clean_title} - {suffix}{extension}'
+        return f'{clean_title} - {suffix}{extension}'
 
-    def download_file(self, file_url, file_name):
-        """Download and save a file"""
+    def get_lesson_dir(self, file_prefix, title):
+        """Create a directory for each lesson"""
+        clean_title = self.clean_filename(title)
+        # Use just the lesson number as the directory name for cleaner structure
+        lesson_dir = os.path.join(self.save_dir, file_prefix)
+        os.makedirs(lesson_dir, exist_ok=True)
+        return lesson_dir
+
+    def download_file(self, file_url, file_name, title, file_prefix):
+        """Download and save a file in the lesson's directory"""
         if Path(file_name).exists():
-            #print(f'\tFile {file_name} exists already, continuing...')
             return False
 
         try:
@@ -159,9 +211,14 @@ class MediaDownloader:
             ok = check_http_error(response, True)
             if not ok:
                 return
-            with open(file_name, 'wb') as f:
+            
+            # Create lesson-specific directory
+            lesson_dir = self.get_lesson_dir(file_prefix, title)
+            full_path = os.path.join(lesson_dir, file_name)
+            
+            with open(full_path, 'wb') as f:
                 f.write(response.content)
-            print(f'\t{file_name} saved on local device!')
+            print(f'\t{file_name} saved in {os.path.basename(lesson_dir)}')
             return True
         except Exception as e:
             print(f'\tFailed to save {file_name}: {e}')
@@ -180,8 +237,8 @@ class MediaDownloader:
         return None
 
 class MediaProcessor:
-    def __init__(self, session, source_url):
-        self.downloader = MediaDownloader(session, source_url)
+    def __init__(self, session, source_url, save_dir='.'):
+        self.downloader = MediaDownloader(session, source_url, save_dir)
         
     def process_audio(self, soup, file_prefix):
         """Process audio files"""
@@ -192,8 +249,8 @@ class MediaProcessor:
                 continue
 
             suffix = self._determine_media_type(file_url)
-            filename = self.downloader.create_filename(file_prefix, soup.title.text, suffix, '.mp3')
-            self.downloader.download_file(file_url, filename)
+            filename = self.downloader.create_filename(soup.title.text, suffix, '.mp3')
+            self.downloader.download_file(file_url, filename, soup.title.text, file_prefix)
 
     def process_video(self, soup, file_prefix):
         """Process video files"""
@@ -205,26 +262,30 @@ class MediaProcessor:
 
             extension = '.' + file_url.split('.')[-1]
             suffix = self._determine_media_type(file_url)
-            filename = self.downloader.create_filename(file_prefix, soup.title.text, suffix, extension)
-            self.downloader.download_file(file_url, filename)
+            filename = self.downloader.create_filename(soup.title.text, suffix, extension)
+            self.downloader.download_file(file_url, filename, soup.title.text, file_prefix)
 
     def process_pdf(self, soup, file_prefix):
         """Process PDF files"""
         pdf_links = soup.find_all('a', href=lambda x: x and '.pdf' in x)
+        print(f"Found {len(pdf_links)} PDF links in lesson")
         pdfnum = 0
         for pdf in pdf_links:
+            print(f"Processing PDF: {pdf.text}")
             pdfnum += 1
             if pdfnum > 2 or "checklist" in pdf.text.lower():
+                print(f"Skipping PDF: {pdf.text}")
                 continue
 
             file_url = self.downloader.get_file_url(pdf, ['href'])
             if not file_url:
+                print(f"No URL found for PDF: {pdf.text}")
                 continue
 
             suffix = 'Lesson Notes' if 'Lesson Notes' in pdf.text else \
                     'Lesson Transcript' if 'Lesson Transcript' in pdf.text else 'PDF'
-            filename = self.downloader.create_filename(file_prefix, soup.title.text, suffix, '.pdf')
-            self.downloader.download_file(file_url, filename)
+            filename = self.downloader.create_filename(soup.title.text, suffix, '.pdf')
+            self.downloader.download_file(file_url, filename, soup.title.text, file_prefix)
 
     def _determine_media_type(self, file_url):
         """Determine media type based on URL"""
@@ -235,7 +296,7 @@ class MediaProcessor:
             return 'Review'
         return 'Main Lesson'
 
-def process_lesson(session, lesson_url, file_index, source_url, prefix_digits):
+def process_lesson(session, lesson_url, file_index, source_url, prefix_digits, save_dir='.'):
     """Process a single lesson"""
     try:
         lesson_source = session.get(lesson_url)
@@ -246,7 +307,7 @@ def process_lesson(session, lesson_url, file_index, source_url, prefix_digits):
             print("Lessons unavailable. Captcha required.")
             exit(1)
 
-        processor = MediaProcessor(session, source_url)
+        processor = MediaProcessor(session, source_url, save_dir)
         file_prefix = str(file_index).zfill(prefix_digits)
         
         print(f'Processing Lesson {file_prefix} - {lesson_soup.title.text}')
@@ -286,13 +347,18 @@ def extract_lesson_urls(session, course_url, source_url):
                         print("URL→" + full_url)
 
         print('Lessons URLs successfully listed.')
-        #if len(lesson_urls) == 0:
-        #    print(course_source.text)
         return lesson_urls
 
     except Exception as e:
         print(f"Error extracting course URLs: {e}")
         return None
+
+def find_starting_index(lesson_urls, start_url):
+    """Find the index of the starting lesson URL"""
+    for i, url in enumerate(lesson_urls):
+        if url == start_url:
+            return i
+    return 0
 
 def validate_course_url(url):
     """Validate that the URL is a lesson and not a lesson library"""
@@ -355,18 +421,30 @@ def main():
         print("No lesson URLs found.")
         return
     prefix_digits = len(str(len(lesson_urls)))
-    # Process each lesson
-    file_index = 1
-    for lesson_url in lesson_urls:
+    # Create organized directory structure
+    # Extract course ID from URL parameter lp=xxx
+    course_id = COURSE_URL.split('?lp=')[1].split('&')[0]
+    course_name = f'course_{course_id}'
+    downloads_dir = os.path.join('downloads', course_name)
+    os.makedirs(downloads_dir, exist_ok=True)
+    save_dir = downloads_dir
+    
+    # Find the starting index based on the provided URL
+    start_index = find_starting_index(lesson_urls, COURSE_URL)
+    if start_index > 0:
+        print(f"Skipping first {start_index} lessons as they have already been downloaded")
+    
+    file_index = start_index + 1
+    for lesson_url in lesson_urls[start_index:]:
         file_prefix = str(file_index).zfill(prefix_digits)
-        existing_prefixes = get_existing_prefixes("./")
+        existing_prefixes = get_existing_prefixes(save_dir)
         
         if file_prefix in existing_prefixes:
             print(f"Skipping lesson with prefix {file_index} (already exists).")
             file_index += 1
             continue
 
-        if process_lesson(session, lesson_url, file_index, SOURCE_URL, prefix_digits):
+        if process_lesson(session, lesson_url, file_index, SOURCE_URL, prefix_digits, save_dir):
             file_index += 1
             if file_index < len(lesson_urls):
                 wait = randint(110, 300)

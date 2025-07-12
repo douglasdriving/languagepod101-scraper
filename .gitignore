@@ -4,3 +4,5 @@ page.py
 .env
 cookies*.txt
 ua.txt
+/downloads
+*.json

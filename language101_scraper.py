@@ -178,7 +178,7 @@ class MediaDownloader:
     def __init__(self, session, source_url, save_dir='.'):
         self.session = session
         self.source_url = source_url
-        self.invalid_chars = '\/?:*"<>|'
+        self.invalid_chars = r'\/:*?"<>|'  # Fixed invalid escape sequence
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
 
@@ -203,7 +203,13 @@ class MediaDownloader:
 
     def download_file(self, file_url, file_name, title, file_prefix):
         """Download and save a file in the lesson's directory"""
-        if Path(file_name).exists():
+        # Create lesson-specific directory
+        lesson_dir = self.get_lesson_dir(file_prefix, title)
+        full_path = os.path.join(lesson_dir, file_name)
+        
+        # Skip if file already exists
+        if os.path.exists(full_path):
+            print(f'\tSkipping {file_name} (already exists)')
             return False
 
         try:
@@ -242,6 +248,7 @@ class MediaProcessor:
         
     def process_audio(self, soup, file_prefix):
         """Process audio files"""
+        # Process regular audio files
         audio_files = soup.find_all('audio')
         for audio in audio_files:
             file_url = self.downloader.get_file_url(audio, ['data-trackurl', 'data-url'])
@@ -251,6 +258,18 @@ class MediaProcessor:
             suffix = self._determine_media_type(file_url)
             filename = self.downloader.create_filename(soup.title.text, suffix, '.mp3')
             self.downloader.download_file(file_url, filename, soup.title.text, file_prefix)
+        
+        # Look for full episode audio in download links
+        download_links = soup.find_all('a', {'download': True, 'data-trackurl': True})
+        for link in download_links:
+            file_url = link.get('data-trackurl')
+            if file_url and file_url.lower().endswith('.mp3'):
+                # Skip if it's a dialogue or review audio (already handled)
+                if any(x in file_url.lower() for x in ['dialogue', 'review']):
+                    continue
+                filename = self.downloader.create_filename(soup.title.text, 'Full Episode', '.mp3')
+                self.downloader.download_file(file_url, filename, soup.title.text, file_prefix)
+                break  # Found the full episode audio, no need to check other links
 
     def process_video(self, soup, file_prefix):
         """Process video files"""
@@ -431,22 +450,28 @@ def main():
     
     # Find the starting index based on the provided URL
     start_index = find_starting_index(lesson_urls, COURSE_URL)
-    if start_index > 0:
-        print(f"Skipping first {start_index} lessons as they have already been downloaded")
     
-    file_index = start_index + 1
-    for lesson_url in lesson_urls[start_index:]:
+    # Override start_index to start from lesson 41 (0-based index 40)
+    start_lesson = 40  # 41st lesson (0-based index 40)
+    if start_lesson < len(lesson_urls):
+        start_index = start_lesson
+    
+    if start_index > 0:
+        print(f"Starting from lesson {start_index + 1} of {len(lesson_urls)}")
+    
+    for i in range(start_index, len(lesson_urls)):
+        file_index = i + 1  # 1-based index for display and filenames
         file_prefix = str(file_index).zfill(prefix_digits)
-        existing_prefixes = get_existing_prefixes(save_dir)
+        lesson_url = lesson_urls[i]
         
-        if file_prefix in existing_prefixes:
-            print(f"Skipping lesson with prefix {file_index} (already exists).")
-            file_index += 1
+        # Skip if the lesson directory already exists and has files
+        lesson_dir = os.path.join(save_dir, file_prefix)
+        if os.path.exists(lesson_dir) and os.listdir(lesson_dir):
+            print(f'Skipping lesson {file_index} (already downloaded)')
             continue
-
+            
         if process_lesson(session, lesson_url, file_index, SOURCE_URL, prefix_digits, save_dir):
-            file_index += 1
-            if file_index < len(lesson_urls):
+            if i + 1 < len(lesson_urls):
                 wait = randint(110, 300)
                 print(f'Pausing {wait}s before scraping next lesson...\n')
                 time.sleep(wait)
